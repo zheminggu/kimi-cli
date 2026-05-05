@@ -37,6 +37,7 @@ from prompt_toolkit.formatted_text import AnyFormattedText, FormattedText, to_fo
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
 from prompt_toolkit.keys import Keys
+from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.layout.containers import (
     ConditionalContainer,
     DynamicContainer,
@@ -86,6 +87,36 @@ class CwdLostError(OSError):
     """Raised when the working directory no longer exists (e.g. external drive unplugged)."""
 
 
+class SlashCommandLexer(Lexer):
+    """Highlight valid slash commands (e.g. ``/help``) in the input buffer."""
+
+    _SLASH_RE = re.compile(r"^\/([a-zA-Z0-9_-]+(?::[a-zA-Z0-9_-]+)*)(?=\s|$)")
+
+    def __init__(self, command_names_provider: Callable[[], set[str]]) -> None:
+        self._command_names_provider = command_names_provider
+
+    @override
+    def lex_document(self, document: Document) -> Callable[[int], list[tuple[str, str]]]:
+        lines = document.lines
+
+        def get_line(lineno: int) -> list[tuple[str, str]]:
+            try:
+                text = lines[lineno]
+            except IndexError:
+                return []
+            m = self._SLASH_RE.match(text)
+            if m:
+                cmd_name = m.group(1)
+                if cmd_name in self._command_names_provider():
+                    return [
+                        ("class:input-slash-command", text[: m.end()]),
+                        ("", text[m.end() :]),
+                    ]
+            return [("", text)]
+
+        return get_line
+
+
 class SlashCommandCompleter(Completer):
     """
     A completer that:
@@ -116,6 +147,10 @@ class SlashCommandCompleter(Completer):
         self._fuzzy_pattern = r"^[^\s]*"
         self._word_completer = WordCompleter(words, WORD=False, pattern=self._word_pattern)
         self._fuzzy = FuzzyCompleter(self._word_completer, WORD=False, pattern=self._fuzzy_pattern)
+
+    def command_names(self) -> set[str]:
+        """Return the set of all recognized command names (including aliases)."""
+        return set(self._command_lookup.keys())
 
     @staticmethod
     def should_complete(document: Document) -> bool:
@@ -1237,15 +1272,18 @@ class CustomPromptSession:
             self._last_history_content = history_entries[-1].content
 
         # Build completers
+        self._agent_slash_completer = SlashCommandCompleter(agent_mode_slash_commands)
         self._agent_mode_completer = merge_completers(
             [
-                SlashCommandCompleter(agent_mode_slash_commands),
+                self._agent_slash_completer,
                 # TODO(kaos): we need an async KaosFileMentionCompleter
                 LocalFileMentionCompleter(KaosPath.cwd().unsafe_to_local_path()),
             ],
             deduplicate=True,
         )
-        self._shell_mode_completer = SlashCommandCompleter(shell_mode_slash_commands)
+        self._shell_slash_completer = SlashCommandCompleter(shell_mode_slash_commands)
+        self._shell_mode_completer = self._shell_slash_completer
+        self._slash_command_names: set[str] = self._agent_slash_completer.command_names()
 
         # Build key bindings
         _kb = KeyBindings()
@@ -1520,6 +1558,7 @@ class CustomPromptSession:
             history=history,
             bottom_toolbar=self._render_bottom_toolbar,
             style=get_prompt_style(),
+            lexer=SlashCommandLexer(lambda: self._slash_command_names),
         )
         self._session.default_buffer.read_only = Condition(
             lambda: (
@@ -1683,9 +1722,11 @@ class CustomPromptSession:
         if self._mode == PromptMode.SHELL:
             if buff is not None:
                 buff.completer = self._shell_mode_completer
+            self._slash_command_names = self._shell_slash_completer.command_names()
         else:
             if buff is not None:
                 buff.completer = self._agent_mode_completer
+            self._slash_command_names = self._agent_slash_completer.command_names()
         self._sync_erase_when_done()
 
     def _sync_erase_when_done(self) -> None:
