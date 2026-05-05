@@ -37,7 +37,7 @@ from kimi_cli.notifications import (
     extract_notification_ids,
 )
 from kimi_cli.skill import Skill, read_skill_text
-from kimi_cli.skill.flow import Flow, FlowEdge, FlowNode, parse_choice
+from kimi_cli.skill.flow import Flow, FlowEdge, FlowNode, parse_choice, parse_done
 from kimi_cli.soul import (
     LLMNotSet,
     LLMNotSupported,
@@ -1362,10 +1362,13 @@ class FlowRunner:
         *,
         name: str | None = None,
         max_moves: int = DEFAULT_MAX_FLOW_MOVES,
+        user_input: str | None = None,
     ) -> None:
         self._flow = flow
         self._name = name
         self._max_moves = max_moves
+        self._user_input = user_input
+        self._first_non_begin_node_id: str | None = None
 
     @staticmethod
     def ralph_loop(
@@ -1408,14 +1411,17 @@ class FlowRunner:
         return FlowRunner(flow, max_moves=max_moves)
 
     async def run(self, soul: KimiSoul, args: str) -> None:
-        if args.strip():
-            command = f"/{FLOW_COMMAND_PREFIX}{self._name}" if self._name else "/flow"
-            logger.warning("Agent flow {command} ignores args: {args}", command=command, args=args)
-            return
+        self._user_input = args.strip() or self._user_input
+
         if self._name:
             from kimi_cli.telemetry import track
 
             track("flow_invoked", flow_name=self._name)
+
+        # Determine the first non-BEGIN node for user-input injection.
+        begin_edges = self._flow.outgoing.get(self._flow.begin_id, [])
+        if begin_edges:
+            self._first_non_begin_node_id = begin_edges[0].dst
 
         current_id = self._flow.begin_id
         moves = 0
@@ -1460,6 +1466,9 @@ class FlowRunner:
             )
             return None, 0
 
+        if node.kind == "dialog":
+            return await self._execute_dialog_node(soul, node, edges)
+
         base_prompt = self._build_flow_prompt(node, edges)
         prompt = base_prompt
         steps_used = 0
@@ -1494,25 +1503,63 @@ class FlowRunner:
                 "Reply with one of the choices using <choice>...</choice>."
             )
 
-    @staticmethod
-    def _build_flow_prompt(node: FlowNode, edges: list[FlowEdge]) -> str | list[ContentPart]:
-        if node.kind != "decision":
-            return node.label
+    def _build_flow_prompt(self, node: FlowNode, edges: list[FlowEdge]) -> str | list[ContentPart]:
+        label = node.label
 
-        if not isinstance(node.label, str):
-            label_text = Message(role="user", content=node.label).extract_text(" ")
-        else:
-            label_text = node.label
-        choices = [edge.label for edge in edges if edge.label]
-        lines = [
-            label_text,
-            "",
-            "Available branches:",
-            *(f"- {choice}" for choice in choices),
-            "",
-            "Reply with a choice using <choice>...</choice>.",
-        ]
-        return "\n".join(lines)
+        # Inject user input into the first non-BEGIN node.
+        if (
+            self._user_input
+            and self._first_non_begin_node_id
+            and node.id == self._first_non_begin_node_id
+        ):
+            if isinstance(label, str):
+                label = f"User request: {self._user_input}\n\n{label}"
+            else:
+                from kosong.message import TextPart
+
+                label = [TextPart(text=f"User request: {self._user_input}\n\n")] + list(label)
+
+        if node.kind == "decision":
+            if not isinstance(label, str):
+                label_text = Message(role="user", content=label).extract_text(" ")
+            else:
+                label_text = label
+            choices = [edge.label for edge in edges if edge.label]
+            lines = [
+                label_text,
+                "",
+                "Available branches:",
+                *(f"- {choice}" for choice in choices),
+                "",
+                "Reply with a choice using <choice>...</choice>.",
+            ]
+            return "\n".join(lines)
+
+        return label
+
+    async def _execute_dialog_node(
+        self,
+        soul: KimiSoul,
+        node: FlowNode,
+        edges: list[FlowEdge],
+    ) -> tuple[str | None, int]:
+        """Execute a dialog node: loop turns until the model outputs <done>."""
+        base_prompt = self._build_flow_prompt(node, edges)
+        prompt = base_prompt
+        steps_used = 0
+
+        while True:
+            result = await self._flow_turn(soul, prompt)
+            steps_used += result.step_count
+            if result.stop_reason == "tool_rejected":
+                logger.error("Agent flow stopped after tool rejection.")
+                return None, steps_used
+
+            if result.final_message and parse_done(result.final_message.extract_text(" ")):
+                return edges[0].dst, steps_used
+
+            # Continue the conversation.
+            prompt = "Please continue."
 
     @staticmethod
     def _match_flow_edge(edges: list[FlowEdge], choice: str | None) -> str | None:

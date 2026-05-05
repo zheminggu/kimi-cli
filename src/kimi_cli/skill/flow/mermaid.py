@@ -9,6 +9,7 @@ from . import (
     FlowNode,
     FlowNodeKind,
     FlowParseError,
+    strip_dialog_prefix,
     validate_flow,
 )
 
@@ -174,6 +175,11 @@ def _add_node(nodes: dict[str, _NodeDef], spec: _NodeSpec, line_no: int) -> Flow
         kind = "begin"
     elif label_norm == "end":
         kind = "end"
+    else:
+        label, is_dialog = strip_dialog_prefix(label)
+        if is_dialog:
+            kind = "dialog"
+            label_norm = label.strip().lower()
 
     node = FlowNode(id=spec.node_id, label=label, kind=kind)
     explicit = spec.label is not None
