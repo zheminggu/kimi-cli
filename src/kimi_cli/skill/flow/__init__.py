@@ -6,7 +6,7 @@ from typing import Literal
 
 from kosong.message import ContentPart
 
-FlowNodeKind = Literal["begin", "end", "task", "decision"]
+FlowNodeKind = Literal["begin", "end", "task", "decision", "dialog"]
 
 
 class FlowError(ValueError):
@@ -44,6 +44,19 @@ class Flow:
 
 
 _CHOICE_RE = re.compile(r"<choice>([^<]*)</choice>")
+_DONE_RE = re.compile(r"<done>")
+_DIALOG_PREFIX_RE = re.compile(r"^@dialog:\s*", re.IGNORECASE)
+
+
+def strip_dialog_prefix(label: str) -> tuple[str, bool]:
+    """Strip the @dialog: prefix from a node label.
+
+    Returns (stripped_label, is_dialog).
+    """
+    match = _DIALOG_PREFIX_RE.match(label.strip())
+    if match:
+        return label.strip()[match.end() :].strip(), True
+    return label, False
 
 
 def parse_choice(text: str) -> str | None:
@@ -51,6 +64,10 @@ def parse_choice(text: str) -> str | None:
     if not matches:
         return None
     return matches[-1].strip()
+
+
+def parse_done(text: str) -> bool:
+    return bool(_DONE_RE.search(text or ""))
 
 
 def validate_flow(

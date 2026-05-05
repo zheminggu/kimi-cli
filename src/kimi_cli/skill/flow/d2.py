@@ -10,6 +10,7 @@ from . import (
     FlowNode,
     FlowNodeKind,
     FlowParseError,
+    strip_dialog_prefix,
     validate_flow,
 )
 
@@ -442,6 +443,11 @@ def _add_node(
         kind = "begin"
     elif label_norm == "end":
         kind = "end"
+    else:
+        label, is_dialog = strip_dialog_prefix(label)
+        if is_dialog:
+            kind = "dialog"
+            label_norm = label.strip().lower()
 
     node = FlowNode(id=node_id, label=label, kind=kind)
     existing = nodes.get(node_id)
